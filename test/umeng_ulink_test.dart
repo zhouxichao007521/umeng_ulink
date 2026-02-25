@@ -23,6 +23,7 @@ class MockUmengUlinkPlatform
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   final UmengUlinkPlatform initialPlatform = UmengUlinkPlatform.instance;
 
   test('$MethodChannelUmengUlink is the default instance', () {

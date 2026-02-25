@@ -1,14 +1,13 @@
 package com.codegather.umeng_ulink
 
 import android.app.Activity
-import android.app.Application
 import android.content.Context
 import android.content.Intent
-import android.os.Bundle
+import android.net.Uri
 import android.util.Log
 import com.umeng.commonsdk.UMConfigure
-import com.umeng.link.UMLinkAgent
-import com.umeng.link.UMLinkCallback
+import com.umeng.umlink.MobclickLink
+import com.umeng.umlink.UMLinkListener
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -16,15 +15,12 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
-import org.json.JSONObject
 
 /**
  * 友盟 U-Link Flutter 插件
  *
- * 支持功能：
- * - 初始化 SDK
- * - 获取安装参数（延迟深度链接）
- * - 处理深度链接唤醒
+ * 使用 Maven Central 的 com.umeng.umsdk:link（包名 com.umeng.umlink，MobclickLink API）
+ * 支持功能：初始化 SDK、获取安装参数（延迟深度链接）、处理深度链接唤醒
  */
 class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     companion object {
@@ -36,6 +32,7 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     private var context: Context? = null
     private var activity: Activity? = null
     private var isInitialized = false
+    private var mobclickLink: MobclickLink? = null
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, CHANNEL_NAME)
@@ -66,7 +63,7 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     }
 
     /**
-     * 初始化友盟 U-Link SDK
+     * 初始化友盟 U-Link SDK（Common + MobclickLink）
      */
     private fun initSdk(arguments: Map<*, *>, result: Result) {
         if (isInitialized) {
@@ -76,7 +73,7 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
         val appKey = arguments["androidAppKey"] as? String
         val debugMode = arguments["debugMode"] as? Boolean ?: false
-        val channel = arguments["channel"] as? String ?: "Flutter"
+        val channelName = arguments["channel"] as? String ?: "Flutter"
 
         if (appKey.isNullOrEmpty()) {
             result.error("INVALID_APPKEY", "androidAppKey cannot be null or empty", null)
@@ -84,32 +81,22 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         }
 
         try {
-            // 设置日志模式
             UMConfigure.setLogEnabled(debugMode)
-
-            // 初始化友盟 Common SDK
             UMConfigure.init(
                 context,
                 appKey,
-                channel,
+                channelName,
                 UMConfigure.DEVICE_TYPE_PHONE,
                 ""
             )
-
-            // 初始化 U-Link SDK
-            UMLinkAgent.getInstance(context).init(object : UMLinkCallback.InitCallback {
-                override fun onComplete() {
-                    Log.d(TAG, "U-Link SDK initialized successfully")
-                    isInitialized = true
-                    // 初始化成功后处理深度链接
-                    activity?.let { handleDeepLink(it) }
-                }
-
-                override fun onError(errorCode: Int, errorMsg: String) {
-                    Log.e(TAG, "U-Link SDK initialization failed: $errorCode - $errorMsg")
-                }
-            })
-
+            val ctx = context ?: run {
+                result.error("INIT_ERROR", "Context is null", null)
+                return
+            }
+            mobclickLink = MobclickLink().also { it.init(ctx) }
+            isInitialized = true
+            Log.d(TAG, "U-Link SDK initialized successfully")
+            activity?.let { handleDeepLink(it) }
             result.success(null)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize U-Link SDK", e)
@@ -119,27 +106,34 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     /**
      * 获取安装参数（延迟深度链接）
+     * MobclickLink.getInstallParams(Context, UMLinkListener) -> onInstall / onError
      */
     private fun getInstallParams(result: Result) {
         if (!isInitialized) {
             result.error("NOT_INITIALIZED", "U-Link SDK is not initialized", null)
             return
         }
-
+        val ctx = context ?: run {
+            result.success(null)
+            return
+        }
         try {
-            UMLinkAgent.getInstance(context).getInstallParams(object : UMLinkCallback.InstallCallback {
-                override fun onResult(params: MutableMap<String, String>?) {
+            MobclickLink.getInstallParams(ctx, object : UMLinkListener {
+                override fun onLink(path: String?, params: HashMap<String, String>?) {
+                    // 用于 getInstallParams 时不会走 onLink，忽略
+                }
+
+                override fun onInstall(params: HashMap<String, String>?, uri: Uri?) {
                     if (params != null && params.isNotEmpty()) {
                         Log.d(TAG, "Install params: $params")
                         result.success(params)
                     } else {
-                        Log.d(TAG, "No install params found")
                         result.success(null)
                     }
                 }
 
-                override fun onError(errorCode: Int, errorMsg: String) {
-                    Log.e(TAG, "Failed to get install params: $errorCode - $errorMsg")
+                override fun onError(msg: String?) {
+                    Log.e(TAG, "Failed to get install params: $msg")
                     result.success(null)
                 }
             })
@@ -151,53 +145,49 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     /**
      * 处理深度链接唤醒
+     * MobclickLink.handleUMLinkURI(Context, Uri, UMLinkListener) -> onLink / onError
      */
     private fun handleDeepLink(activity: Activity) {
-        val intent = activity.intent
-        if (intent != null && intent.data != null) {
-            Log.d(TAG, "Handling deep link: ${intent.data}")
-            UMLinkAgent.getInstance(context).handleDeepLink(intent, object : UMLinkCallback.DeepLinkCallback {
-                override fun onResult(params: MutableMap<String, String>?) {
-                    if (params != null && params.isNotEmpty()) {
-                        Log.d(TAG, "Deep link params: $params")
-                        channel.invokeMethod("onLinkReceived", params)
-                    }
+        val uri = activity.intent?.data ?: return
+        val ctx = context ?: return
+        Log.d(TAG, "Handling deep link: $uri")
+        MobclickLink.handleUMLinkURI(ctx, uri, object : UMLinkListener {
+            override fun onLink(path: String?, params: HashMap<String, String>?) {
+                if (params != null && params.isNotEmpty()) {
+                    Log.d(TAG, "Deep link params: $params")
+                    channel.invokeMethod("onLinkReceived", params)
                 }
+            }
 
-                override fun onError(errorCode: Int, errorMsg: String) {
-                    Log.e(TAG, "Failed to handle deep link: $errorCode - $errorMsg")
-                }
-            })
-        }
+            override fun onInstall(params: HashMap<String, String>?, uri: Uri?) {}
+
+            override fun onError(msg: String?) {
+                Log.e(TAG, "Failed to handle deep link: $msg")
+            }
+        })
     }
 
-    /**
-     * 获取 SDK 版本
-     */
     private fun getSdkVersion(): String {
         return try {
-            // 友盟 SDK 版本
-            "U-Link 1.3.0"
+            MobclickLink.getVersion() ?: "U-Link 1.2.0"
         } catch (e: Exception) {
-            "Unknown"
+            "U-Link 1.2.0"
         }
     }
 
-    // ActivityAware callbacks
     override fun onAttachedToActivity(binding: ActivityPluginBinding) {
         activity = binding.activity
-        binding.addOnNewIntentListener { intent ->
+        binding.addOnNewIntentListener { intent: Intent? ->
             intent?.let {
                 activity?.intent = it
                 if (isInitialized) {
-                    handleDeepLink(activity!!)
+                    activity?.let { a -> handleDeepLink(a) }
                 }
             }
             true
         }
-        // 如果已经初始化，处理当前的深度链接
         if (isInitialized) {
-            handleDeepLink(activity!!)
+            activity?.let { handleDeepLink(it) }
         }
     }
 
@@ -216,5 +206,6 @@ class UmengUlinkPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
         context = null
+        mobclickLink = null
     }
 }
